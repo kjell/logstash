@@ -45,7 +45,10 @@ class LogStash::Inputs::Twitter < LogStash::Inputs::Base
   config :oauth_token_secret, :validate => :password, :required => true
 
   # Any keywords to track in the twitter stream
-  config :keywords, :validate => :array, :required => true
+  config :keywords, :validate => :array
+
+  # Any location to track in the twitter stream
+  config :location, :validate => :string
 
   public
   def register
@@ -60,8 +63,11 @@ class LogStash::Inputs::Twitter < LogStash::Inputs::Base
 
   public
   def run(queue)
-    @logger.info("Starting twitter tracking", :keywords => @keywords)
-    @client.filter(:track => @keywords.join(",")) do |tweet|
+    @logger.info("Starting twitter tracking", :keywords => @keywords, :location => @location)
+    filters = {}
+    filters[:track] = @keywords.join(",") if @keywords
+    filters[:locations] = @location if @location
+    @client.filter(filters) do |tweet|
       @logger.info? && @logger.info("Got tweet", :user => tweet.user.screen_name, :text => tweet.text)
       event = LogStash::Event.new(
         "@timestamp" => tweet.created_at.gmtime,
@@ -69,14 +75,50 @@ class LogStash::Inputs::Twitter < LogStash::Inputs::Base
         "user" => tweet.user.screen_name,
         "client" => tweet.source,
         "retweeted" => tweet.retweeted?,
-        "source" => "http://twitter.com/#{tweet.user.screen_name}/status/#{tweet.id}"
+        "source" => "http://twitter.com/#{tweet.user.screen_name}/status/#{tweet.id}",
       )
       decorate(event)
       event["in-reply-to"] = tweet.in_reply_to_status_id if tweet.reply?
-      unless tweet.urls.empty?
-        event["urls"] = tweet.urls.map(&:expanded_url).map(&:to_s)
+
+      # Extract 'entities' into their own field:
+      #   media (pictures, video)
+      #   urls (links)
+      #   hashtags (#)
+      #   user_mentions (@)
+      {
+        media: 'media_url_https',
+        urls: 'expanded_url',
+        hashtags: 'text',
+        user_mentions: 'screen_name'
+      }.each do |_entity, key|
+        unless (entity = tweet.send(_entity)).empty?
+          event[_entity] = entity.map(&key.to_sym).map(&:to_s)
+        end
       end
-      queue << event
+
+      # For tweets with geocoordinates
+      # Add the coords to the event
+      # Check that the tweet is actually within the specified bounds,
+      # twitter's geo-accuracy isn't great.
+      # Only keep events that are inside our @location
+      if @location && tweet.geo && !(coords = tweet.geo.coordinates).nil?
+        event['latlng'] = coords.to_s
+        swlon, swlat, nelon, nelat = @location.split(',').map(&:to_f)
+        sw = [swlat, swlon]
+        ne = [nelat, nelon]
+
+        lls = sw.zip(coords, ne)
+        geofenced = lls.all? {|sw, point, ne| !!point && sw < point && point < ne}
+      end
+
+      match = tweet.text.match(/artsmia/) || tweet.user.screen_name.match(/artsmia/) || event[:urls] && event[:urls].any? {|url| url.match(/artsmia/) }
+      # Only add the event if it's in our geofence or has our keywords in the full_text
+      if geofenced || match
+        puts '.'
+        queue << event
+      end
     end # client.filter
+  rescue Interrupt
+    return
   end # def run
 end # class LogStash::Inputs::Twitter
